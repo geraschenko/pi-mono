@@ -113,6 +113,7 @@ Intentional deviations from `--mode rpc` are allowed only where interactive TUI 
 {"type":"hello","protocol":"pi-rpc-socket","version":1}
 ```
 
+- The hello record is the first record sent on every connection. Event broadcast to that client begins only after the hello record has been queued for that client.
 - A slow or stuck client must not stall interactive mode or other clients. The server must use bounded per-client output buffering and disconnect a client whose backlog exceeds the configured bound.
 - On normal process shutdown, the server must emit a final socket-only shutdown event before closing client connections. Initial shape:
 
@@ -159,7 +160,7 @@ All normal session events emitted today by `session.subscribe(...)` remain visib
 The following deviations are intentional and required for interactive TUI ownership:
 
 - `extension_ui_request` events are not emitted on the socket.
-- `extension_ui_response` commands are not accepted on the socket. If received, they must be rejected with a normal error response.
+- `extension_ui_response` commands are not accepted on the socket. If received, they must be rejected through the same unknown-command error path used for unsupported RPC commands.
 - Socket clients receive `ui_wait_start` / `ui_wait_end` summary events instead of the interactive request/response sub-protocol.
 - Socket mode may emit socket-only connection/shutdown records such as the connection hello event and final shutdown event.
 
@@ -176,8 +177,7 @@ Required event family:
   "request": {
     "method": "confirm",
     "title": "Run project-local agents?",
-    "message": "Project agents are repo-controlled. Only continue for trusted repositories.",
-    "optionCount": 2
+    "message": "Project agents are repo-controlled. Only continue for trusted repositories."
   }
 }
 ```
@@ -203,9 +203,10 @@ Payload contract:
   - `input`
   - `editor`
   - `custom`
-- `title` is included when the interactive UI API provides one.
+- `title` is included on `ui_wait_start` when the interactive UI API provides one.
+- `title` may be repeated on `ui_wait_end` for client convenience. When present there, it is informational only and must match the title from the corresponding start event.
 - `message` is included only for `confirm` requests. It is omitted for `input`, `editor`, and `custom` waits to avoid mirroring arbitrary user-entered or extension-generated text over the socket.
-- `optionCount` is included for `select` and `confirm` when known.
+- `optionCount` is included for `select` when known.
 - `resolution` must be one of:
   - `selected`
   - `confirmed`
@@ -219,7 +220,7 @@ Behavioral requirements:
 
 - `ui_wait_start` is emitted when the interactive UI begins waiting for human input on behalf of an extension UI request.
 - `ui_wait_end` is emitted when that wait finishes.
-- `ctx.ui.custom()` waits are in scope. When a custom interactive component blocks the session until completion, it must also emit `ui_wait_start` / `ui_wait_end` with `method: "custom"`.
+- Every `ctx.ui.custom()` call is in scope and must emit `ui_wait_start` / `ui_wait_end` with `method: "custom"`.
 
 ## Ownership Model
 
@@ -319,8 +320,10 @@ The feature is successful if all of the following are true:
 4. Human use of built-in interactive features and TUI-native extensions continues to work.
 5. External prompts can be submitted while the human is typing without clobbering the editor.
 6. If an extension blocks on human-facing UI, socket clients receive explicit wait visibility via the new `ui_wait_*` events.
-7. After session replacement operations, connected socket clients continue to observe and control the new active session.
+7. After session replacement operations, connected socket clients continue to observe and control the new active session without reconnecting.
 8. No terminal scraping or simulated keystrokes are required for orchestration.
+9. A slow or stuck socket client cannot stall interactive mode or other connected clients.
+10. Connected socket clients continue working across session replacement without requiring a new socket connection.
 
 ## Concrete Examples
 
@@ -402,7 +405,7 @@ Expected result:
 - A socket client submits a command while the session is already streaming.
 - A human submits a message while socket-originated messages are queued.
 - Multiple socket clients submit commands close together.
-- An extension command initiated over the socket opens a long-lived editor dialog or custom TUI component in the interactive UI and no human is present to resolve it.
+- An extension command initiated over the socket opens a long-lived editor dialog or custom TUI component in the interactive UI and no human is present to resolve it. In v1 this may deadlock until `abort` or process shutdown, which is acceptable.
 - The active session is replaced while clients are connected.
 - The socket client disconnects during an active run.
 - A UI wait ends by cancellation, timeout, abort, or custom component closure rather than successful input.
@@ -665,7 +668,7 @@ type RpcSocketUiWaitStartEvent = {
     method: RpcSocketUiWaitMethod;
     title?: string;
     message?: string; // confirm only
-    optionCount?: number;
+    optionCount?: number; // select only
   };
 };
 
@@ -674,7 +677,7 @@ type RpcSocketUiWaitEndEvent = {
   requestId: string;
   request: {
     method: RpcSocketUiWaitMethod;
-    title?: string;
+    title?: string; // informational only; mirrors start when present
   };
   resolution:
     | "selected"
@@ -781,6 +784,7 @@ A future implementation could be staged roughly as:
 - [x] Wrote initial standalone spec draft in `docs/pi-rpc-socket-mode.md`
 - [x] Incorporated first review pass findings about single-owner rebind hooks, protocol deviations, and pinned `ui_wait_*` payloads
 - [x] Added one-line decisions for late join, socket permissions, TTY requirement, backpressure, path validation, `InputSource`, shutdown, and command-set completeness
+- [x] Incorporated second review pass tightening around `custom()` scope, hello/shutdown ordering, `ui_wait_*` payload details, deadlock semantics, and measurable success criteria
 
 ### Notes
 
@@ -788,3 +792,4 @@ A future implementation could be staged roughly as:
 - The most important architectural constraint recorded here is that interactive mode must remain the sole extension UI owner; otherwise the feature would degrade the extension ecosystem in the same way as current RPC mode.
 - First review pass identified a hard architectural blocker in `AgentSessionRuntime` callback ownership. The spec now treats additive lifecycle listeners as a prerequisite rather than an implementation detail.
 - The spec now documents the main protocol deviation from stdio RPC mode: no `extension_ui_request` / `extension_ui_response` flow on the socket, replaced by `ui_wait_*` visibility events.
+- Second review pass focused on tightening semantics rather than changing architecture. The remaining decisions were about making the wire contract and lifecycle behavior explicit enough for a new implementer and client author.
