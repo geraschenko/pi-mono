@@ -327,6 +327,28 @@ The feature is successful if all of the following are true:
 
 ## Concrete Examples
 
+### Example: debug watcher sidecar for the tee use case
+
+This feature should be exercised early with a concrete end-to-end example consisting of two processes:
+
+1. `pi --rpc-socket /tmp/pi.sock`
+2. a separate example client binary that connects to the socket, prints every received record, and watches for user messages containing the word `chilidog`
+
+When the sidecar sees a user-authored message containing `chilidog`, it should send a steering command:
+
+```json
+{"type":"steer","message":"I love those dogs!"}
+```
+
+Expected result:
+
+- the sidecar prints the initial socket `hello` record and all subsequent events/responses for debugging
+- the sidecar does not own the terminal or extension UI
+- when the human sends a message containing `chilidog`, the sidecar sends the steer command over the socket
+- the requesting sidecar connection receives the normal `steer` response
+- all connected clients continue receiving broadcast session events
+- this example remains intentionally simple so it can serve as an early manual integration test and a long-lived maintenance smoke test for the fork
+
 ### Example: external prompt while human is typing
 
 State:
@@ -761,6 +783,25 @@ A future implementation could be staged roughly as:
 6. UI wait event instrumentation around interactive extension dialogs
 7. protocol/docs alignment review against `rpc.md`
 
+## Implementation-time decisions
+
+This section records decisions made during implementation so the fork stays understandable and maintenance-friendly.
+
+### Decision log
+
+- No implementation-time decisions recorded yet.
+
+### Maintenance bias for this fork
+
+The implementation should prefer the smallest change surface that preserves compatibility with upstream pi behavior:
+
+- prefer adding a new socket-specific helper over large transport abstractions
+- prefer reusing existing RPC helpers and types over inventing a parallel protocol stack
+- prefer localized changes in `main.ts`, runtime lifecycle wiring, and a new socket server module over broad refactors of interactive mode
+- avoid changing interactive editor behavior unless required by the spec
+- avoid modifying extension APIs or extension author contracts for v1
+- keep the example sidecar simple and self-contained so it can act as a regression probe for future rebases
+
 # WORK LOG
 
 ### Initial Repo State
@@ -785,6 +826,74 @@ A future implementation could be staged roughly as:
 - [x] Incorporated first review pass findings about single-owner rebind hooks, protocol deviations, and pinned `ui_wait_*` payloads
 - [x] Added one-line decisions for late join, socket permissions, TTY requirement, backpressure, path validation, `InputSource`, shutdown, and command-set completeness
 - [x] Incorporated second review pass tightening around `custom()` scope, hello/shutdown ordering, `ui_wait_*` payload details, deadlock semantics, and measurable success criteria
+
+### Concrete implementation plan
+
+The implementation plan is intentionally biased toward minimal maintenance burden for a long-lived fork.
+
+1. Write the example sidecar first
+   - Add a tiny example client binary that connects to the Unix socket, prints all JSONL records, and sends `steer` with `I love those dogs!` when it observes a user message containing `chilidog`.
+   - Keep it intentionally dumb and transport-focused so it becomes an immediate progress probe.
+   - Goal: derisk framing, event shapes, and basic command routing before touching interactive internals too much.
+
+2. Inventory existing RPC-mode reuse points
+   - Read `rpc-mode.ts`, `rpc-types.ts`, `jsonl.ts`, and interactive mode lifecycle wiring.
+   - Identify the smallest extractable command-dispatch and response-writing helpers needed by both stdio RPC and socket RPC.
+   - Record any implementation-time decisions in the new decision log before making larger refactors.
+
+3. Add additive runtime lifecycle listeners with minimal API churn
+   - Generalize `AgentSessionRuntime` rebind/invalidate lifecycle from single-owner callbacks to additive listeners.
+   - Update current call sites with the smallest possible compatibility-preserving edits.
+   - Derisking: this is the main architectural prerequisite, so land it before building socket mode on top.
+
+4. Add CLI parsing and startup validation for `--rpc-socket`
+   - Reject incompatible combinations with `--mode rpc`, `--mode json`, and `--print`.
+   - Require interactive TTY availability.
+   - Resolve and validate the socket path before starting the long-running session.
+   - Keep failure behavior simple and fail-fast.
+
+5. Add a standalone socket server module
+   - Implement Unix domain socket bind/listen/cleanup, JSONL framing, hello record, bounded per-client buffering, and per-client response routing.
+   - Subscribe to session events and broadcast compatible event payloads.
+   - Keep extension UI ownership entirely out of this module.
+
+6. Reuse RPC command handling with the smallest viable extraction
+   - Prefer a small shared command-dispatch helper over a broad transport abstraction.
+   - Keep stdio RPC behavior unchanged except where code is mechanically shared.
+   - Reject `extension_ui_response` on the socket via the existing unsupported-command path.
+
+7. Wire socket server into interactive mode startup
+   - Start normal interactive mode.
+   - Start the socket server alongside it.
+   - Ensure socket connections survive runtime/session replacement via rebinding.
+   - Re-establish event subscriptions after `/new`, `/resume`, `/fork`, `/clone`, and similar replacement paths.
+
+8. Add UI wait instrumentation with minimal blast radius
+   - Prefer wrapping the interactive `ExtensionUIContext` blocking methods instead of modifying extension APIs.
+   - Emit `ui_wait_start` / `ui_wait_end` only for socket visibility.
+   - Reinstall the wrapper after session replacement.
+
+9. Manual verification pause: sidecar smoke test
+   - Run `pi --rpc-socket ...` plus the example sidecar.
+   - Verify hello, event printing, steer injection on `chilidog`, and editor preservation while typing.
+   - If the implementation shape has drifted from the spec in a meaningful way, pause and update the decision log before continuing.
+
+10. Documentation alignment and cleanup
+   - Update `packages/coding-agent/docs/rpc.md` and any CLI help text only after the implementation shape is stable.
+   - Keep docs narrowly scoped to avoid unnecessary maintenance overhead.
+
+### Explicit derisking strategy
+
+- Do the example sidecar early.
+- Do lifecycle-listener refactoring before socket transport integration.
+- Avoid broad transport abstractions unless command-sharing duplication becomes clearly worse than a small refactor.
+- Prefer manual smoke checks early, then `npm run check` after code changes stabilize.
+
+### Planned pauses for user verification
+
+- Pause after the example sidecar and minimal socket handshake are working if the user wants an early review of the wire shape.
+- Pause after lifecycle rebinding and multi-client event broadcast are working if implementation complexity starts to exceed the minimal-change goal.
+- Otherwise proceed through the full implementation and present the manual test path plus the example sidecar behavior at the end.
 
 ### Notes
 
