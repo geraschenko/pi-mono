@@ -29,6 +29,7 @@ When `--rpc-socket <path>` is supplied, pi behaves like normal interactive mode 
   - TUI-native extension UI such as `ctx.ui.custom()`, `setFooter()`, `setHeader()`, `setEditorComponent()`, overlays, and custom renderers
   - normal editor behavior, including preserving partially typed text while external clients submit prompts
 - `--rpc-socket` must not require the human to share terminal ownership with a machine client.
+- `--rpc-socket` requires interactive TTY operation. If interactive mode would not be available because stdin is not a TTY, pi must exit with an error instead of silently falling back to print mode.
 
 ### Orchestrator-facing goals
 
@@ -73,8 +74,13 @@ If `--rpc-socket` is combined with any of the above, pi must exit with an error 
 ### Socket path behavior
 
 - The socket path is required.
+- Relative paths are resolved against the current working directory before binding.
+- The parent directory must already exist. Missing parent directories are an error.
 - If a filesystem entry already exists at that path, pi exits with an error instead of removing or replacing it.
-- The implementation may remove the socket file it created during clean shutdown, but that cleanup behavior is not required as a compatibility guarantee for this spec.
+- If the resolved path is too long for the platform's Unix socket path limit, pi exits with an error before starting interactive mode.
+- The created socket must be restricted to the current user, with effective permissions equivalent to `0600`.
+- The implementation should remove the socket file it created during clean shutdown.
+- After an unclean shutdown, a stale socket file may remain and will block restart by design until the operator removes it manually.
 
 ## Protocol Contract
 
@@ -92,45 +98,40 @@ The compatibility target is:
 - same event shapes for existing agent/session/tool events
 - same JSONL framing rules
 
-Intentional deviations from `--mode rpc` are allowed only where interactive TUI ownership makes them necessary. Every such deviation must be documented.
+Intentional deviations from `--mode rpc` are allowed only where interactive TUI ownership makes them necessary. Every such deviation must be documented in this spec.
 
 ### Transport
 
 - Transport is Unix domain socket.
 - Records are LF-delimited JSON objects using the same framing rules as current RPC mode.
 - Events are broadcast to all connected clients.
-- Responses are routed only to the requesting client.
+- Responses are routed only to the requesting client connection.
+- A newly connected client receives future events only. Catch-up is performed explicitly via commands such as `get_state`, `get_messages`, and `get_session_stats`.
+- The server must emit a connection-scoped hello record immediately after connect so a client can verify it is speaking to an `--rpc-socket` endpoint. Initial shape:
+
+```json
+{"type":"hello","protocol":"pi-rpc-socket","version":1}
+```
+
+- A slow or stuck client must not stall interactive mode or other clients. The server must use bounded per-client output buffering and disconnect a client whose backlog exceeds the configured bound.
+- On normal process shutdown, the server must emit a final socket-only shutdown event before closing client connections. Initial shape:
+
+```json
+{"type":"shutdown"}
+```
 
 ### Command semantics
 
-All currently supported RPC commands remain in scope as compatibility targets, including at minimum:
-
-- `prompt`
-- `steer`
-- `follow_up`
-- `abort`
-- `get_state`
-- `get_messages`
-- `set_model`
-- `cycle_model`
-- `set_thinking_level`
-- `cycle_thinking_level`
-- `new_session`
-- `switch_session`
-- `fork`
-- `clone`
-- `compact`
-- `get_session_stats`
-- `get_commands`
-- `get_last_assistant_text`
-- `set_session_name`
+The canonical command set for `--rpc-socket` is the command set defined in `packages/coding-agent/src/modes/rpc/rpc-types.ts` for `RpcCommand`, except where a documented deviation below says otherwise.
 
 Behavioral requirements:
 
 - Socket-originated `prompt` behaves like RPC `prompt` as closely as possible.
 - Socket-originated extension commands are allowed. If such a command triggers extension UI, the human-facing TUI handles it.
 - Message acceptance and queueing semantics continue to respect the session's existing `prompt`/`steer`/`followUp` behavior.
-- Human and socket-originated sends must flow through one shared serialization point so that ordering is deterministic within a single pi process.
+- Socket-originated prompts use `source: "rpc"` for `InputSource` purposes so that extensions and session logic observe the same source category they already see in stdio RPC mode.
+- Human and socket-originated sends share one effective serialization point because both ultimately invoke the same session APIs on the same Node.js event loop. Human sends still perform interactive-editor preprocessing first; socket sends do not. Deterministic ordering is therefore defined by the order in which those final session API calls are made within the process.
+- Responses are routed by client connection identity, not by command `id`. The `id` field remains optional and is used only for client-side correlation, exactly as in current RPC mode.
 
 ### Event semantics
 
@@ -153,19 +154,30 @@ All normal session events emitted today by `session.subscribe(...)` remain visib
 - `auto_retry_end`
 - `extension_error`
 
+### Documented deviations from `--mode rpc`
+
+The following deviations are intentional and required for interactive TUI ownership:
+
+- `extension_ui_request` events are not emitted on the socket.
+- `extension_ui_response` commands are not accepted on the socket. If received, they must be rejected with a normal error response.
+- Socket clients receive `ui_wait_start` / `ui_wait_end` summary events instead of the interactive request/response sub-protocol.
+- Socket mode may emit socket-only connection/shutdown records such as the connection hello event and final shutdown event.
+
 ### New `--rpc-socket`-specific UI wait events
 
 Add new events specific to `--rpc-socket` mode for visibility into human-mediated extension UI waits.
 
-Initial event family:
+Required event family:
 
 ```json
 {
   "type": "ui_wait_start",
+  "requestId": "6a9f7c54-3c68-4e31-a550-602889b7b8af",
   "request": {
     "method": "confirm",
     "title": "Run project-local agents?",
-    "message": "...optional..."
+    "message": "Project agents are repo-controlled. Only continue for trusted repositories.",
+    "optionCount": 2
   }
 }
 ```
@@ -173,6 +185,7 @@ Initial event family:
 ```json
 {
   "type": "ui_wait_end",
+  "requestId": "6a9f7c54-3c68-4e31-a550-602889b7b8af",
   "request": {
     "method": "confirm",
     "title": "Run project-local agents?"
@@ -181,17 +194,32 @@ Initial event family:
 }
 ```
 
-Minimum requirements:
+Payload contract:
 
-- `ui_wait_start` is emitted when the interactive UI begins waiting for human input on behalf of an extension UI request.
-- `ui_wait_end` is emitted when that wait finishes, whether by confirmation, selection, input submission, cancellation, timeout, or abort.
-- `request.method` should distinguish at least:
+- `requestId: string` is required on both start and end events so clients can pair them.
+- `request.method` must distinguish at least:
   - `select`
   - `confirm`
   - `input`
   - `editor`
-- Human-readable metadata such as `title`, `message`, and possibly option count may be included when available.
-- The exact payload shape may be refined during implementation, but the capability is required.
+  - `custom`
+- `title` is included when the interactive UI API provides one.
+- `message` is included only for `confirm` requests. It is omitted for `input`, `editor`, and `custom` waits to avoid mirroring arbitrary user-entered or extension-generated text over the socket.
+- `optionCount` is included for `select` and `confirm` when known.
+- `resolution` must be one of:
+  - `selected`
+  - `confirmed`
+  - `submitted`
+  - `cancelled`
+  - `timed_out`
+  - `aborted`
+  - `closed`
+
+Behavioral requirements:
+
+- `ui_wait_start` is emitted when the interactive UI begins waiting for human input on behalf of an extension UI request.
+- `ui_wait_end` is emitted when that wait finishes.
+- `ctx.ui.custom()` waits are in scope. When a custom interactive component blocks the session until completion, it must also emit `ui_wait_start` / `ui_wait_end` with `method: "custom"`.
 
 ## Ownership Model
 
@@ -224,6 +252,7 @@ If a socket client submits a message while the human is typing in the editor but
 - the socket-originated message is processed normally
 - the human's unsent editor contents remain unchanged
 - the human may continue editing and later send that text through the same session
+- editor-local actions such as history updates, slash-command dispatch, and visual editor clearing remain human-only behavior and are not replayed for socket-originated commands
 
 ## Runtime Replacement and Session Rebinding
 
@@ -235,11 +264,17 @@ The socket server must survive interactive runtime/session replacement and conti
 - `/clone`
 - reload paths that replace the current runtime/session
 
+Required architectural prerequisite:
+
+- `AgentSessionRuntime` currently exposes single-owner callbacks via `setRebindSession(...)` and `setBeforeSessionInvalidate(...)`. `--rpc-socket` requires this to be generalized so both interactive mode and the socket server can observe runtime replacement safely.
+- The implementation must introduce a multi-listener mechanism for these lifecycle hooks, or an equivalent explicit fan-out owner that both interactive mode and the socket server register with. This prerequisite is mandatory; the socket server may not rely on winning a last-writer-wins callback race.
+
 Requirements:
 
 - existing socket connections remain valid if the process stays alive
 - event subscriptions are rebound to the new active session/runtime
 - subsequent commands target the new active session/runtime
+- any instrumentation wrapper around interactive extension UI must also be re-established after session replacement
 
 ## Error Handling
 
@@ -248,7 +283,9 @@ Requirements:
 pi must fail fast with a clear error if:
 
 - `--rpc-socket` is used with an incompatible mode flag
+- `--rpc-socket` is used without interactive TTY availability
 - the socket path already exists
+- the socket path is invalid for Unix socket binding
 - the socket cannot be created or bound
 
 ### Client-level errors
@@ -316,28 +353,61 @@ Expected result:
 - When the human resolves the dialog, socket clients receive `ui_wait_end`.
 - The command continues according to the human's answer.
 
-### Example: inactive orchestrator client
+### Example: socket `steer` while streaming
+
+State:
+
+- The agent is already streaming a response.
+- A socket client sends:
+
+```json
+{"id":"2","type":"steer","message":"Focus on auth edge cases."}
+```
+
+Expected result:
+
+- The requesting client receives:
+
+```json
+{"id":"2","type":"response","command":"steer","success":true}
+```
+
+- All connected clients receive the resulting `queue_update` and later normal session events.
+- If the human is typing in the editor during this time, their unsent text remains unchanged.
+
+### Example: multi-client response routing
 
 State:
 
 - Two clients are connected to the socket.
-- One client issues commands.
-- The other is event-only.
+- Client A sends:
+
+```json
+{"id":"req-7","type":"get_state"}
+```
 
 Expected result:
 
-- Both receive broadcast events.
-- Only the requesting client receives the command response object with matching `id`.
+- Client A receives:
+
+```json
+{"id":"req-7","type":"response","command":"get_state","success":true,"data":{}}
+```
+
+- Client B does not receive that response.
+- Both clients continue receiving broadcast events.
 
 ## Edge Cases
 
 - A socket client submits a command while the session is already streaming.
 - A human submits a message while socket-originated messages are queued.
 - Multiple socket clients submit commands close together.
-- An extension command initiated over the socket opens a long-lived editor dialog in the TUI.
+- An extension command initiated over the socket opens a long-lived editor dialog or custom TUI component in the interactive UI and no human is present to resolve it.
 - The active session is replaced while clients are connected.
 - The socket client disconnects during an active run.
-- A UI wait ends by cancellation, timeout, or abort rather than successful input.
+- A UI wait ends by cancellation, timeout, abort, or custom component closure rather than successful input.
+- A late-joining client connects mid-session and must catch up via explicit state queries.
+- A client stops reading and exceeds the per-connection output backlog bound.
 
 ## Non-Goals
 
@@ -493,45 +563,21 @@ Trade-off:
   - executes commands against the active session/runtime
   - hooks runtime/session rebinding when the active session changes
 
-### Open question to verify during implementation
+### Mode-specific binding rule
 
-Whether socket command handlers need any additional mode-specific bindings beyond what interactive mode already installs. If so, keep those bindings orthogonal to UI ownership.
+If socket command handlers need mode-specific bindings beyond what interactive mode already installs, those bindings must remain orthogonal to UI ownership. Socket mode may add observers, transport plumbing, and lifecycle hooks, but it must not install a second extension UI context.
 
 ## Single serialization point
 
-The spec requires one serialization point shared by human and socket clients.
+The spec requires one effective serialization point shared by human and socket clients.
 
-The implementation should avoid creating a second independent submission path that bypasses interactive mode ordering assumptions.
+The intended implementation model is:
 
-Possible strategies:
+- human submits go through interactive editor preprocessing in `interactive-mode.ts` and then call the same session APIs used elsewhere (`session.prompt()`, `session.steer()`, `session.followUp()`)
+- socket-originated commands call those same session APIs directly, without replaying editor-local behavior such as history updates, slash-command parsing, or editor clearing
+- ordering is therefore determined by the order in which those final session API calls are scheduled on the single Node.js event loop for the process
 
-### Strategy A: submit directly to `session.prompt()` / `session.steer()` / `session.followUp()` from both sides
-
-If both human sends and socket sends already funnel into session APIs with deterministic ordering on the JS event loop, this may be sufficient.
-
-What to verify:
-
-- whether interactive mode has any extra pre-submit behavior that must also apply to socket submissions
-- whether editor history, pending bash flushes, or command preprocessing occur before `session.prompt()` and whether those are human-only concerns or session-wide concerns
-
-### Strategy B: introduce an explicit send queue above the session APIs
-
-Define a shared sender queue for:
-
-- human editor submit
-- socket `prompt`
-- socket `steer`
-- socket `follow_up`
-
-Advantages:
-
-- ordering semantics become explicit and testable
-
-Trade-off:
-
-- more invasive than using existing session behavior
-
-Given current knowledge, Strategy A is preferable if existing session APIs already provide deterministic ordering and human-only UI state is preserved.
+This is sufficient for the v1 contract. The implementation should not introduce an additional shared queue unless the existing session APIs prove unable to preserve deterministic in-process ordering.
 
 ## Multi-client socket server
 
@@ -570,17 +616,18 @@ There are at least two plausible places to instrument this:
 
 #### Approach 1: wrap or extend the interactive `ExtensionUIContext`
 
-Interactive mode already creates the real UI context. Wrap the dialog methods:
+Interactive mode already creates the real UI context. Wrap the blocking methods:
 
 - `select`
 - `confirm`
 - `input`
 - `editor`
+- `custom`
 
 Pseudo-shape:
 
-- before awaiting the real dialog, broadcast `ui_wait_start`
-- after resolution/cancel/timeout/abort, broadcast `ui_wait_end`
+- before awaiting the real dialog/component completion, broadcast `ui_wait_start`
+- after resolution/cancel/timeout/abort/close, broadcast `ui_wait_end`
 
 Advantages:
 
@@ -590,6 +637,7 @@ Advantages:
 Trade-off:
 
 - requires care so that interactive behavior is unchanged
+- requires the wrapper to be reinstalled after session replacement
 
 #### Approach 2: instrument at extension runner boundaries
 
@@ -605,18 +653,18 @@ Trade-off:
 
 Current preference: Approach 1.
 
-### Payload ideas
-
-Initial payload candidates:
+### Payload sketch aligned with SPEC
 
 ```ts
+type RpcSocketUiWaitMethod = "select" | "confirm" | "input" | "editor" | "custom";
+
 type RpcSocketUiWaitStartEvent = {
   type: "ui_wait_start";
   requestId: string;
   request: {
-    method: "select" | "confirm" | "input" | "editor";
+    method: RpcSocketUiWaitMethod;
     title?: string;
-    message?: string;
+    message?: string; // confirm only
     optionCount?: number;
   };
 };
@@ -625,7 +673,7 @@ type RpcSocketUiWaitEndEvent = {
   type: "ui_wait_end";
   requestId: string;
   request: {
-    method: "select" | "confirm" | "input" | "editor";
+    method: RpcSocketUiWaitMethod;
     title?: string;
   };
   resolution:
@@ -634,15 +682,15 @@ type RpcSocketUiWaitEndEvent = {
     | "submitted"
     | "cancelled"
     | "timed_out"
-    | "aborted";
+    | "aborted"
+    | "closed";
 };
 ```
 
-Open refinement questions for review:
+Deliberate privacy rule for v1:
 
-- whether to include redacted vs full prompt text for `input`/`editor`
-- whether `message` should be included by default or omitted for privacy/minimality
-- whether this event family should later be generalized to stdio RPC mode too
+- do not mirror arbitrary text from `input`, `editor`, or `custom` flows over the socket
+- only `confirm` messages may be mirrored in `request.message`
 
 ## Runtime replacement and rebinding
 
@@ -652,25 +700,33 @@ Open refinement questions for review:
 - unsubscribe/resubscribe on rebind
 - use `runtimeHost.setRebindSession(...)`
 
-That pattern should be adapted for the socket server.
+However, that exact pattern is insufficient for `--rpc-socket` because `AgentSessionRuntime` currently stores only one rebind callback and one before-invalidate callback.
 
-Things to verify in the source:
+Recommended prerequisite refactor:
 
-- exactly how interactive mode handles runtime replacement today
-- whether there is one authoritative place to hook socket-server rebinds, or whether both interactive mode and socket server must independently respond to runtime changes
+- replace `setRebindSession(...)` / `setBeforeSessionInvalidate(...)` with additive listener registration, for example:
+  - `addRebindSessionListener(listener): () => void`
+  - `addBeforeSessionInvalidateListener(listener): () => void`
+- update interactive mode, print mode, RPC mode, and the new socket server to use listener registration instead of last-writer-wins assignment
+
+After that prerequisite, the socket server can reuse the existing mutable-session/unsubscribe-resubscribe pattern safely.
 
 ## Socket lifecycle and shutdown
 
 ### Startup
 
+- resolve the socket path to an absolute path
+- validate parent directory existence and path-length constraints before interactive startup
 - validate that no entry exists at the socket path
 - bind the socket before entering the long-running interactive loop, or fail fast
+- restrict the created socket to current-user access equivalent to `0600`
 
 ### Shutdown
 
-Likely responsibilities:
+Responsibilities:
 
 - stop accepting new connections
+- emit the final socket-only shutdown event to connected clients when shutdown is orderly
 - close active connections
 - unlink the socket file if this process created it
 
@@ -723,9 +779,12 @@ A future implementation could be staged roughly as:
 - [x] Captured multi-client broadcast/response routing goals
 - [x] Added concrete code references for future implementation work
 - [x] Wrote initial standalone spec draft in `docs/pi-rpc-socket-mode.md`
+- [x] Incorporated first review pass findings about single-owner rebind hooks, protocol deviations, and pinned `ui_wait_*` payloads
+- [x] Added one-line decisions for late join, socket permissions, TTY requirement, backpressure, path validation, `InputSource`, shutdown, and command-set completeness
 
 ### Notes
 
 - Discussion established that the desired feature is not “interactive mode plus stdout RPC”, but rather “interactive mode plus out-of-band RPC socket”.
 - The most important architectural constraint recorded here is that interactive mode must remain the sole extension UI owner; otherwise the feature would degrade the extension ecosystem in the same way as current RPC mode.
-- Some payload details for `ui_wait_*` events are intentionally left flexible in `IMPLEMENTATION IDEAS` for later review/refinement.
+- First review pass identified a hard architectural blocker in `AgentSessionRuntime` callback ownership. The spec now treats additive lifecycle listeners as a prerequisite rather than an implementation detail.
+- The spec now documents the main protocol deviation from stdio RPC mode: no `extension_ui_request` / `extension_ui_response` flow on the socket, replaced by `ui_wait_*` visibility events.
