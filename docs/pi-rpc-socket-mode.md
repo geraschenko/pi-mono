@@ -36,8 +36,7 @@ When `--rpc-socket <path>` is supplied, pi behaves like normal interactive mode 
 - Command and event payloads should match `--mode rpc` wherever possible.
 - Multiple clients may connect simultaneously.
   - Events are broadcast to all connected clients.
-  - Responses go only to the client that issued the command.
-  - Any connected client may issue commands.
+  - Any connected client may issue commands. Responses go only to the client that issued the command.
 - The human user is conceptually another sender into the same session. Message ordering uses a single serialization point shared by:
   - human submissions from the editor
   - commands received over the RPC socket
