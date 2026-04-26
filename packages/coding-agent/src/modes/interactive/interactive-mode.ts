@@ -94,6 +94,14 @@ import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+import type {
+	RpcExtensionErrorEvent,
+	RpcSocketSideChannelEvent,
+	RpcSocketUiWaitEndEvent,
+	RpcSocketUiWaitMethod,
+	RpcSocketUiWaitResolution,
+	RpcSocketUiWaitStartEvent,
+} from "../rpc/rpc-types.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
@@ -255,6 +263,10 @@ export interface InteractiveModeOptions {
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
 	verbose?: boolean;
+	/** Emits socket-side visibility events without changing interactive ownership. */
+	sideChannelEventSink?: (event: RpcSocketSideChannelEvent) => void;
+	/** Called during graceful shutdown before runtime disposal and process exit. */
+	beforeShutdown?: () => Promise<void>;
 }
 
 export class InteractiveMode {
@@ -383,10 +395,10 @@ export class InteractiveMode {
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
 		this.options = options;
-		this.runtimeHost.setBeforeSessionInvalidate(() => {
+		this.runtimeHost.addBeforeSessionInvalidateListener(() => {
 			this.resetExtensionUI();
 		});
-		this.runtimeHost.setRebindSession(async () => {
+		this.runtimeHost.addRebindSessionListener(async () => {
 			await this.rebindCurrentSession();
 		});
 		this.version = VERSION;
@@ -1578,6 +1590,13 @@ export class InteractiveMode {
 			},
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
+				const event: RpcExtensionErrorEvent = {
+					type: "extension_error",
+					extensionPath: error.extensionPath,
+					event: error.event,
+					error: error.error,
+				};
+				this.emitSideChannelEvent(event);
 			},
 		});
 
@@ -1982,14 +2001,88 @@ export class InteractiveMode {
 		this.extensionTerminalInputUnsubscribers.clear();
 	}
 
+	private emitSideChannelEvent(event: RpcSocketSideChannelEvent): void {
+		this.options.sideChannelEventSink?.(event);
+	}
+
+	private createUiWaitStartEvent(
+		method: RpcSocketUiWaitMethod,
+		requestId: string,
+		request: { title?: string; message?: string; optionCount?: number },
+	): RpcSocketUiWaitStartEvent {
+		return {
+			type: "ui_wait_start",
+			requestId,
+			request: {
+				method,
+				...(request.title ? { title: request.title } : {}),
+				...(request.message ? { message: request.message } : {}),
+				...(request.optionCount !== undefined ? { optionCount: request.optionCount } : {}),
+			},
+		};
+	}
+
+	private createUiWaitEndEvent(
+		method: RpcSocketUiWaitMethod,
+		requestId: string,
+		resolution: RpcSocketUiWaitResolution,
+		title?: string,
+	): RpcSocketUiWaitEndEvent {
+		return {
+			type: "ui_wait_end",
+			requestId,
+			request: {
+				method,
+				...(title ? { title } : {}),
+			},
+			resolution,
+		};
+	}
+
+	private async withUiWaitEvent<T>(
+		method: RpcSocketUiWaitMethod,
+		request: { title?: string; message?: string; optionCount?: number },
+		run: () => Promise<T>,
+		getResolution: (result: T) => RpcSocketUiWaitResolution,
+	): Promise<T> {
+		const requestId = crypto.randomUUID();
+		this.emitSideChannelEvent(this.createUiWaitStartEvent(method, requestId, request));
+		try {
+			const result = await run();
+			this.emitSideChannelEvent(this.createUiWaitEndEvent(method, requestId, getResolution(result), request.title));
+			return result;
+		} catch (error) {
+			this.emitSideChannelEvent(this.createUiWaitEndEvent(method, requestId, "aborted", request.title));
+			throw error;
+		}
+	}
+
 	/**
 	 * Create the ExtensionUIContext for extensions.
 	 */
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
-			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			select: (title, options, opts) =>
+				this.withUiWaitEvent(
+					"select",
+					{ title, optionCount: options.length },
+					() => this.showExtensionSelector(title, options, opts),
+					(result) => (result === undefined ? "cancelled" : "selected"),
+				),
+			confirm: (title, message, opts) =>
+				this.withUiWaitEvent(
+					"confirm",
+					{ title, message },
+					() => this.showExtensionConfirm(title, message, opts),
+					(result) => (result ? "confirmed" : "cancelled"),
+				),
+			input: (title, placeholder, opts) =>
+				this.withUiWaitEvent(
+					"input",
+					{ title },
+					() => this.showExtensionInput(title, placeholder, opts),
+					(result) => (result === undefined ? "cancelled" : "submitted"),
+				),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2006,11 +2099,23 @@ export class InteractiveMode {
 			setFooter: (factory) => this.setExtensionFooter(factory),
 			setHeader: (factory) => this.setExtensionHeader(factory),
 			setTitle: (title) => this.ui.terminal.setTitle(title),
-			custom: (factory, options) => this.showExtensionCustom(factory, options),
+			custom: (factory, options) =>
+				this.withUiWaitEvent(
+					"custom",
+					{},
+					() => this.showExtensionCustom(factory, options),
+					() => "submitted",
+				),
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
-			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
+			editor: (title, prefill) =>
+				this.withUiWaitEvent(
+					"editor",
+					{ title },
+					() => this.showExtensionEditor(title, prefill),
+					(result) => (result === undefined ? "cancelled" : "submitted"),
+				),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
 				this.setupAutocompleteProvider();
@@ -3306,6 +3411,7 @@ export class InteractiveMode {
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
+		await this.options.beforeShutdown?.();
 		await this.runtimeHost.dispose();
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);

@@ -64,7 +64,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	registerSignalHandlers();
 
-	runtimeHost.setRebindSession(async () => {
+	runtimeHost.addRebindSessionListener(async () => {
 		await rebindSession();
 	});
 
