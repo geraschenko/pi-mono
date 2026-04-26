@@ -5,9 +5,9 @@
  * Responses and events are emitted as JSON lines on stdout.
  */
 
-import type { AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { AgentEvent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model } from "@mariozechner/pi-ai";
-import type { SessionStats } from "../../core/agent-session.js";
+import type { AgentSessionEvent, SessionStats } from "../../core/agent-session.js";
 import type { BashResult } from "../../core/bash-executor.js";
 import type { CompactionResult } from "../../core/compaction/index.js";
 import type { SourceInfo } from "../../core/source-info.js";
@@ -262,3 +262,67 @@ export type RpcExtensionUIResponse =
 // ============================================================================
 
 export type RpcCommandType = RpcCommand["type"];
+
+// ============================================================================
+// RPC Socket records and events (Unix socket transport)
+// ============================================================================
+
+export type RpcSocketUiWaitMethod = "select" | "confirm" | "input" | "editor" | "custom";
+
+export type RpcSocketUiWaitResolution =
+	| "selected"
+	| "confirmed"
+	| "submitted"
+	| "cancelled"
+	| "timed_out"
+	| "aborted"
+	| "closed";
+
+export interface RpcSocketHelloRecord {
+	type: "hello";
+	protocol: "pi-rpc-socket";
+	version: 1;
+}
+
+export interface RpcSocketShutdownRecord {
+	type: "shutdown";
+}
+
+export interface RpcSocketUiWaitStartEvent {
+	type: "ui_wait_start";
+	requestId: string;
+	request: {
+		method: RpcSocketUiWaitMethod;
+		title?: string;
+		message?: string;
+		optionCount?: number;
+	};
+}
+
+export interface RpcSocketUiWaitEndEvent {
+	type: "ui_wait_end";
+	requestId: string;
+	request: {
+		method: RpcSocketUiWaitMethod;
+		title?: string;
+	};
+	resolution: RpcSocketUiWaitResolution;
+}
+
+export interface RpcExtensionErrorEvent {
+	type: "extension_error";
+	extensionPath: string;
+	event: string;
+	error: string;
+}
+
+export type RpcSocketSideChannelEvent = RpcSocketUiWaitStartEvent | RpcSocketUiWaitEndEvent | RpcExtensionErrorEvent;
+
+export type RpcSocketBroadcastEvent = AgentEvent | AgentSessionEvent | RpcSocketSideChannelEvent;
+
+export type RpcSocketRecord =
+	| RpcSocketHelloRecord
+	| RpcSocketShutdownRecord
+	| RpcResponse
+	| RpcExtensionUIRequest
+	| RpcSocketBroadcastEvent;

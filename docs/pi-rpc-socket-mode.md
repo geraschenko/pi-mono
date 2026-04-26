@@ -789,7 +789,11 @@ This section records decisions made during implementation so the fork stays unde
 
 ### Decision log
 
-- No implementation-time decisions recorded yet.
+- Kept `AgentSessionRuntime.setRebindSession(...)` and `setBeforeSessionInvalidate(...)` for compatibility, but implemented additive listener support via new `addRebindSessionListener(...)` and `addBeforeSessionInvalidateListener(...)` methods. This minimizes fork drift while removing the single-owner callback limitation.
+- Extracted shared RPC command execution into a small helper instead of introducing a transport abstraction. This keeps `--mode rpc` and `--rpc-socket` aligned while avoiding a broad refactor.
+- Kept interactive mode as the only extension UI owner and added a narrow `sideChannelEventSink` hook for socket-only events (`ui_wait_*`, `extension_error`). This avoids changing extension APIs.
+- Added a narrow `beforeShutdown` hook to interactive mode so the socket server can emit its final shutdown record and unlink the socket during normal interactive shutdown without restructuring interactive mode itself.
+- Added the tee sidecar as `packages/coding-agent/examples/rpc-socket-tee.ts` and used it as the first concrete smoke-test target.
 
 ### Maintenance bias for this fork
 
@@ -898,6 +902,13 @@ The implementation plan is intentionally biased toward minimal maintenance burde
 ### Notes
 
 - Discussion established that the desired feature is not “interactive mode plus stdout RPC”, but rather “interactive mode plus out-of-band RPC socket”.
+- Initial implementation work completed the early sidecar example first, then the minimum shared-RPC extraction and runtime-listener refactor needed to support the socket server.
+- Early manual smoke checks from source verified:
+  - `--rpc-socket` rejects incompatible `--mode rpc`
+  - a socket file is created with `srw-------` permissions
+  - a client receives the connection hello record
+  - `get_state` succeeds over the Unix socket
+  - the example sidecar connects and prints the hello record
 - The most important architectural constraint recorded here is that interactive mode must remain the sole extension UI owner; otherwise the feature would degrade the extension ecosystem in the same way as current RPC mode.
 - First review pass identified a hard architectural blocker in `AgentSessionRuntime` callback ownership. The spec now treats additive lifecycle listeners as a prerequisite rather than an implementation detail.
 - The spec now documents the main protocol deviation from stdio RPC mode: no `extension_ui_request` / `extension_ui_response` flow on the socket, replaced by `ui_wait_*` visibility events.

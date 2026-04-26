@@ -65,8 +65,10 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  * caller. The caller is responsible for user-facing error handling.
  */
 export class AgentSessionRuntime {
-	private rebindSession?: (session: AgentSession) => Promise<void>;
-	private beforeSessionInvalidate?: () => void;
+	private readonly rebindSessionListeners = new Set<(session: AgentSession) => Promise<void>>();
+	private readonly beforeSessionInvalidateListeners = new Set<() => void>();
+	private legacyRebindSessionListener?: (session: AgentSession) => Promise<void>;
+	private legacyBeforeSessionInvalidateListener?: () => void;
 
 	constructor(
 		private _session: AgentSession,
@@ -97,7 +99,23 @@ export class AgentSessionRuntime {
 	}
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
-		this.rebindSession = rebindSession;
+		if (this.legacyRebindSessionListener) {
+			this.rebindSessionListeners.delete(this.legacyRebindSessionListener);
+		}
+		this.legacyRebindSessionListener = rebindSession;
+		if (rebindSession) {
+			this.rebindSessionListeners.add(rebindSession);
+		}
+	}
+
+	addRebindSessionListener(rebindSession: (session: AgentSession) => Promise<void>): () => void {
+		this.rebindSessionListeners.add(rebindSession);
+		return () => {
+			this.rebindSessionListeners.delete(rebindSession);
+			if (this.legacyRebindSessionListener === rebindSession) {
+				this.legacyRebindSessionListener = undefined;
+			}
+		};
 	}
 
 	/**
@@ -109,7 +127,23 @@ export class AgentSessionRuntime {
 	 * context becomes stale.
 	 */
 	setBeforeSessionInvalidate(beforeSessionInvalidate?: () => void): void {
-		this.beforeSessionInvalidate = beforeSessionInvalidate;
+		if (this.legacyBeforeSessionInvalidateListener) {
+			this.beforeSessionInvalidateListeners.delete(this.legacyBeforeSessionInvalidateListener);
+		}
+		this.legacyBeforeSessionInvalidateListener = beforeSessionInvalidate;
+		if (beforeSessionInvalidate) {
+			this.beforeSessionInvalidateListeners.add(beforeSessionInvalidate);
+		}
+	}
+
+	addBeforeSessionInvalidateListener(beforeSessionInvalidate: () => void): () => void {
+		this.beforeSessionInvalidateListeners.add(beforeSessionInvalidate);
+		return () => {
+			this.beforeSessionInvalidateListeners.delete(beforeSessionInvalidate);
+			if (this.legacyBeforeSessionInvalidateListener === beforeSessionInvalidate) {
+				this.legacyBeforeSessionInvalidateListener = undefined;
+			}
+		};
 	}
 
 	private async emitBeforeSwitch(
@@ -152,7 +186,9 @@ export class AgentSessionRuntime {
 			reason,
 			targetSessionFile,
 		});
-		this.beforeSessionInvalidate?.();
+		for (const beforeSessionInvalidate of this.beforeSessionInvalidateListeners) {
+			beforeSessionInvalidate();
+		}
 		this.session.dispose();
 	}
 
@@ -164,8 +200,8 @@ export class AgentSessionRuntime {
 	}
 
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
-		if (this.rebindSession) {
-			await this.rebindSession(this.session);
+		for (const rebindSession of this.rebindSessionListeners) {
+			await rebindSession(this.session);
 		}
 		if (withSession) {
 			await withSession(this.session.createReplacedSessionContext());
@@ -368,7 +404,9 @@ export class AgentSessionRuntime {
 			type: "session_shutdown",
 			reason: "quit",
 		});
-		this.beforeSessionInvalidate?.();
+		for (const beforeSessionInvalidate of this.beforeSessionInvalidateListeners) {
+			beforeSessionInvalidate();
+		}
 		this.session.dispose();
 	}
 }
