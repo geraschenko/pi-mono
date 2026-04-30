@@ -32,6 +32,7 @@ export interface Args {
 	extensions?: string[];
 	noExtensions?: boolean;
 	print?: boolean;
+	rpcSocket?: string;
 	export?: string;
 	noSkills?: boolean;
 	skills?: string[];
@@ -122,6 +123,8 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
+		} else if (arg === "--rpc-socket" && i + 1 < args.length) {
+			result.rpcSocket = args[++i];
 		} else if (arg === "--export" && i + 1 < args.length) {
 			result.export = args[++i];
 		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
@@ -216,6 +219,7 @@ ${chalk.bold("Options:")}
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
+  --rpc-socket <path>            Interactive mode with a JSONL RPC side channel over a Unix socket
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

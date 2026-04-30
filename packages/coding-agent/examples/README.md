@@ -18,6 +18,11 @@ Example extensions demonstrating:
 - External integrations (SSH, file watchers, system theme sync)
 - Custom providers (Anthropic with custom streaming, GitLab Duo)
 
+## Standalone examples
+
+- [rpc-extension-ui.ts](rpc-extension-ui.ts) - spawn `pi --mode rpc` and drive it from a custom TUI
+- [rpc-socket-tee.ts](rpc-socket-tee.ts) - connect to `pi --rpc-socket`, print all records, and inject a steer when a user message contains `chilidog`
+
 ## Documentation
 
 - [SDK Reference](sdk/README.md)

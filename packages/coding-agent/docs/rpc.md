@@ -16,6 +16,26 @@ Common options:
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
 
+## Interactive RPC Socket Mode
+
+If you need the normal interactive TUI and a machine-readable control channel at the same time, use:
+
+```bash
+pi --rpc-socket /tmp/pi.sock [options]
+```
+
+This keeps the terminal owned by interactive pi and exposes the RPC protocol over a Unix domain socket instead of stdin/stdout.
+
+Key differences from `--mode rpc`:
+- the socket connection receives an initial hello record: `{"type":"hello","protocol":"pi-rpc-socket","version":1}`
+- events are broadcast to all connected clients
+- responses are sent only to the client that issued the command
+- `extension_ui_request` / `extension_ui_response` are not used on the socket
+- socket clients receive `ui_wait_start` / `ui_wait_end` summary events when interactive extension UI is waiting on a human
+- normal shutdown emits a final `{"type":"shutdown"}` record before the socket closes
+
+The command set and normal session event payloads otherwise match `--mode rpc` as closely as possible.
+
 ## Protocol Overview
 
 - **Commands**: JSON objects sent to stdin, one per line
