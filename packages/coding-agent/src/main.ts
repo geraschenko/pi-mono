@@ -41,7 +41,7 @@ import { assertValidSessionId, SessionManager } from "./core/session-manager.ts"
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
+import { InteractiveMode, runPrintMode, runRpcMode, runRpcSocketServer } from "./modes/index.ts";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
@@ -111,6 +111,28 @@ function resolveAppMode(parsed: Args, stdinIsTTY: boolean): AppMode {
 
 function toPrintOutputMode(appMode: AppMode): Exclude<Mode, "rpc"> {
 	return appMode === "json" ? "json" : "text";
+}
+
+function validateRpcSocketFlags(parsed: Args, stdinIsTTY: boolean): void {
+	if (!parsed.rpcSocket) {
+		return;
+	}
+
+	const conflictingFlags = [
+		parsed.mode === "rpc" ? "--mode rpc" : undefined,
+		parsed.mode === "json" ? "--mode json" : undefined,
+		parsed.print ? "--print" : undefined,
+	].filter((flag): flag is string => flag !== undefined);
+
+	if (conflictingFlags.length > 0) {
+		console.error(chalk.red(`Error: --rpc-socket cannot be combined with ${conflictingFlags.join(", ")}`));
+		process.exit(1);
+	}
+
+	if (!stdinIsTTY) {
+		console.error(chalk.red("Error: --rpc-socket requires interactive TTY stdin"));
+		process.exit(1);
+	}
 }
 
 async function prepareInitialMessage(
@@ -505,6 +527,7 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 	}
 	time("parseArgs");
+	validateRpcSocketFlags(parsed, process.stdin.isTTY);
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY);
 	const shouldTakeOverStdout = appMode !== "interactive";
 	if (shouldTakeOverStdout) {
@@ -743,6 +766,19 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
+		let rpcSocketServer: Awaited<ReturnType<typeof runRpcSocketServer>> | undefined;
+		if (parsed.rpcSocket) {
+			try {
+				rpcSocketServer = await runRpcSocketServer(runtime, {
+					socketPath: parsed.rpcSocket,
+				});
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(chalk.red(`Error: ${message}`));
+				process.exit(1);
+			}
+		}
+
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
 			modelFallbackMessage,
@@ -750,12 +786,19 @@ export async function main(args: string[], options?: MainOptions) {
 			initialImages,
 			initialMessages: parsed.messages,
 			verbose: parsed.verbose,
+			sideChannelEventSink: rpcSocketServer
+				? (event) => {
+						rpcSocketServer.broadcastEvent(event);
+					}
+				: undefined,
+			beforeShutdown: rpcSocketServer ? () => rpcSocketServer.closeGracefully() : undefined,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();
 			time("interactiveMode.init");
 			printTimings();
 			interactiveMode.stop();
+			await rpcSocketServer?.closeGracefully();
 			stopThemeWatcher();
 			if (process.stdout.writableLength > 0) {
 				await new Promise<void>((resolve) => process.stdout.once("drain", resolve));
